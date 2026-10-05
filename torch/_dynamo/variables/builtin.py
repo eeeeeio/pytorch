@@ -77,6 +77,7 @@ from ..utils import (
     has_torch_function,
     is_tensor_getset_descriptor,
     istype,
+    list_methods,
     no_keywords,
     numpy_operator_wrapper,
     proxy_args_kwargs,
@@ -4184,6 +4185,25 @@ class ListBuiltinVariable(BaseBuiltinVariable):
                     [],
                     tx=tx,
                 )
+
+        resolved_fn = getattr(list, name, None)
+        if (
+            args
+            and isinstance(args[0], ListVariable)
+            and resolved_fn in list_methods
+        ):
+            # Unbound list method, written out (list.copy(lst)) or read out as
+            # a value (`copier = list.copy`).  Only a list receiver is
+            # dispatched: CPython raises TypeError for anything else, and
+            # dispatching by name would silently run another type's method of
+            # the same name.  Subclasses come first because
+            # UserDefinedListVariable is also a ListVariable and its
+            # call_method resolves through the MRO to a Python override, while
+            # methoddescr_call runs list's own C slot.
+            obj = args[0]
+            if isinstance(obj, UserDefinedObjectVariable):
+                return obj.call_base_method(tx, name, args[1:], kwargs)
+            return obj.call_method(tx, name, args[1:], kwargs)
 
         return super().call_method(tx, name, args, kwargs)
 
