@@ -26,6 +26,7 @@ from ._all_gather_layout import (
     AllGatherLayout,
     BackendOwnedAllGatherLayout,
     DEFAULT_ALL_GATHER_LAYOUT,
+    DefaultAllGatherLayout,
 )
 from ._fsdp_api import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
 from ._fsdp_collectives import (
@@ -413,6 +414,11 @@ class FSDPParamGroup:
         self._register_state_dict_hooks()
 
     def set_symm_mem(self, backend: Literal["NCCL"] = "NCCL") -> None:
+        if self._all_gather_layout.comm is not None:
+            raise AssertionError(
+                "cannot call set_symm_mem() while the all-gather layout is bound "
+                "to its comm"
+            )
         if not isinstance(self._all_gather_comm, (DefaultAllGather | SymmMemAllGather)):
             raise AssertionError(
                 "cannot call set_symm_mem() "
@@ -439,6 +445,11 @@ class FSDPParamGroup:
         Whether to (try to) use the ProcessGroup's allocate_tensor method for
         the staging buffers for collective comms.
         """
+        if self._all_gather_layout.comm is not None:
+            raise AssertionError(
+                "cannot call set_allocate_memory_from_process_group() while the "
+                "all-gather layout is bound to its comm"
+            )
         if not isinstance(
             self._all_gather_comm, (DefaultAllGather | ProcessGroupAllocAllGather)
         ):
@@ -570,6 +581,7 @@ class FSDPParamGroup:
                     self._all_gather_result,
                     self.fsdp_params,
                     self._all_gather_process_group,
+                    self._all_gather_layout,
                     self._all_gather_buffers,
                 )
 
@@ -1124,14 +1136,16 @@ class FSDPParamGroup:
     def _to_sharded(self):
         if not self.is_sharded:
             if self._all_gather_result is not None:
-                # Discard a post-forward mesh prefetch before changing meshes
+                # A backward prefetch of a group that backward did not use was
+                # gathered over the post-forward mesh, which a later forward
+                # cannot copy out, so wait for it and discard it
                 _wait_all_gather(self._all_gather_result)
                 self._all_gather_result = None
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_sharded()
             self._sharded_state = ShardedState.SHARDED
-            self._free_all_gather_buffers()
-            self._release_all_gather_output()
+            if type(self._all_gather_layout) is not DefaultAllGatherLayout:
+                self._free_layout_storage()
 
     def _to_sharded_post_forward(self):
         if not self.is_sharded_post_forward:
@@ -1140,12 +1154,15 @@ class FSDPParamGroup:
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_sharded_post_forward()
             self._sharded_state = ShardedState.SHARDED_POST_FORWARD
-            self._free_all_gather_buffers()
-            self._release_all_gather_output()
+            if type(self._all_gather_layout) is not DefaultAllGatherLayout:
+                self._free_layout_storage()
 
-    def _free_all_gather_buffers(self) -> None:
+    def _free_layout_storage(self) -> None:
+        """Frees the FSDP-owned buffers that a custom layout chose and releases
+        a backend-owned layout's output lease."""
         if self._all_gather_buffers is not None:
             self._all_gather_buffers.free()
+        self._release_all_gather_output()
 
     def _release_all_gather_output(self) -> None:
         if isinstance(self._all_gather_layout, BackendOwnedAllGatherLayout):

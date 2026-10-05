@@ -14,6 +14,11 @@ parameter allocates and frees, and refills it with an ``AllGatherOutputFn``.
 Only a ``BackendOwnedAllGatherLayout`` may instead return views into storage the
 backend owns, which FSDP keeps across reshard.
 
+A layout that needs a specific collective holds it as ``comm``.
+``FSDPModule.set_all_gather_layout`` is the only way to install a layout, and
+installing a layout with a ``comm`` installs that comm too; FSDP then rejects
+any other all-gather comm for the group until a different layout is installed.
+
 ``AllGatherLayout`` and its metadata types are private authoring interfaces;
 out-of-tree backends must target a matching revision of them.
 """
@@ -29,6 +34,7 @@ import torch
 
 
 if TYPE_CHECKING:
+    from ._fsdp_api import AllGather
     from ._fsdp_param import FSDPParam
 
 
@@ -142,6 +148,24 @@ class AllGatherOutputs:
 
 
 @dataclass
+class AllGatherFinalizeMetadata:
+    """Arguments of ``AllGatherLayout.finalize_outputs``, in one object so that
+    new fields do not break out-of-tree layouts.
+
+    ``all_gather_output`` is the completed collective output and
+    ``output_metadata`` is what ``prepare`` returned for this call. ``buffers``
+    is empty on the group's first unshard and afterwards holds the group's
+    persistent buffers with storage re-allocated.
+    """
+
+    all_gather_output: torch.Tensor
+    param_metadata: list[AllGatherParamMetadata]
+    world_size: int
+    output_metadata: object | None
+    buffers: list[torch.Tensor]
+
+
+@dataclass
 class _PersistentBuffers:
     """FSDP-owned buffers that a layout chose on a group's first unshard and
     the storage size of each in bytes, which may exceed a view's own size."""
@@ -174,9 +198,11 @@ class AllGatherLayout(ABC):
     FSDP orders collective completion before finalization and owns the
     persistent buffers that finalize returns (see the module documentation). A
     stateful layout instance belongs to one parameter group.
-    ``DefaultAllGatherLayout`` is stateless and may be shared.
+    ``DefaultAllGatherLayout`` is stateless and may be shared. ``comm`` is the
+    collective this layout requires, if any, which FSDP installs with it.
     """
 
+    comm: AllGather | None = None
     _owner: object | None = None
 
     def _bind_owner(self, owner: object) -> None:
@@ -231,21 +257,14 @@ class AllGatherLayout(ABC):
         return all_gather_input, all_gather_output
 
     @abstractmethod
-    def finalize_outputs(
-        self,
-        all_gather_output: torch.Tensor,
-        param_metadata: list[AllGatherParamMetadata],
-        world_size: int,
-        output_metadata: object | None,
-        buffers: list[torch.Tensor],
-    ) -> AllGatherOutputs:
+    def finalize_outputs(self, metadata: AllGatherFinalizeMetadata) -> AllGatherOutputs:
         """Fill the parameters' outputs after collective completion on the current stream.
 
-        On the group's first unshard ``buffers`` is empty: allocate the
+        On the group's first unshard ``metadata.buffers`` is empty: allocate the
         persistent buffers and return outputs that view them. Later calls pass
         those buffers, with storage re-allocated, and the adopted outputs in
-        ``param_metadata``, which must be refilled in place and returned, under
-        preserved version counters.
+        ``metadata.param_metadata``, which must be refilled in place and
+        returned, under preserved version counters.
         """
         ...
 
@@ -348,23 +367,17 @@ class DefaultAllGatherLayout(AllGatherLayout):
             rank,
         )
 
-    def finalize_outputs(
-        self,
-        all_gather_output: torch.Tensor,
-        param_metadata: list[AllGatherParamMetadata],
-        world_size: int,
-        output_metadata: object | None,
-        buffers: list[torch.Tensor],
-    ) -> AllGatherOutputs:
-        # FSDP passes a plan with allocated outputs for its own groups; custom
-        # layouts that delegate rank-major output pass per-parameter metadata
-        if isinstance(output_metadata, _DefaultAllGatherCopyPlan):
-            plan, new_buffers = output_metadata, []
+    def finalize_outputs(self, metadata: AllGatherFinalizeMetadata) -> AllGatherOutputs:
+        all_gather_output, world_size = metadata.all_gather_output, metadata.world_size
+        # FSDP passes a plan with allocated outputs for a custom layout's
+        # fallback; custom layouts that delegate pass per-parameter metadata
+        if isinstance(metadata.output_metadata, _DefaultAllGatherCopyPlan):
+            plan, new_buffers = metadata.output_metadata, []
         else:
             plan, new_buffers = _plan_rank_major_outputs(
-                all_gather_output, param_metadata, world_size
+                all_gather_output, metadata.param_metadata, world_size
             )
-        buffers = buffers or new_buffers
+        buffers = metadata.buffers or new_buffers
         if all_gather_output.numel() == 0:
             return AllGatherOutputs(plan.outputs, buffers)
         if plan.clone_input:

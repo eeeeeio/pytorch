@@ -6,8 +6,6 @@ from dataclasses import dataclass, KW_ONLY
 import torch
 import torch.distributed as dist
 
-from ._all_gather_layout import AllGatherLayout, DEFAULT_ALL_GATHER_LAYOUT
-
 
 _ReduceOp = dist.ReduceOp | dist.ReduceOp.RedOpType
 
@@ -113,13 +111,7 @@ class Comm(ABC):
 class AllGather(Comm):
     """
     Interface for all_gather comm primitive
-
-    ``layout`` is installed with the comm by ``set_custom_all_gather`` and
-    selects input packing and output handling; a backend whose collective
-    produces a custom layout provides its matching ``AllGatherLayout``.
     """
-
-    layout: AllGatherLayout = DEFAULT_ALL_GATHER_LAYOUT
 
     @abstractmethod
     def __call__(
