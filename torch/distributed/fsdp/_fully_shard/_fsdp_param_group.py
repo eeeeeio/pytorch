@@ -645,7 +645,7 @@ class FSDPParamGroup:
             self._reshard_after_forward_event = None
         for fsdp_param in self.fsdp_params:
             fsdp_param.sharded_param.grad = None
-            leaf = fsdp_param._unsharded_param
+            leaf = getattr(fsdp_param, "_unsharded_param", None)
             if leaf is not None:
                 leaf.grad = None
         self._set_unsharded_grad_dtypes(defer_upcast=False)
@@ -956,7 +956,7 @@ class FSDPParamGroup:
         # gradients, and the reduce-scatter copy-in upcasts the rest. Only a
         # gradient that starts accumulating across backwards needs the cast.
         for fsdp_param in self._fsdp_params_with_wider_grad_dtype:
-            param = fsdp_param._unsharded_param
+            param = getattr(fsdp_param, "_unsharded_param", None)
             if param is None or not param.requires_grad:
                 continue
             grad, dtype = param.grad, fsdp_param.unsharded_grad_dtype
@@ -1007,7 +1007,7 @@ class FSDPParamGroup:
 
     def _get_unsharded_grad_to_reduce(self, param: FSDPParam) -> torch.Tensor | None:
         """Returns the unsharded gradient to reduce-scatter, or ``None`` to skip."""
-        if param._unsharded_param is None:
+        if not hasattr(param, "_unsharded_param"):
             return None
         unsharded_param = param.unsharded_param
         # A group unused in this microbatch may still own gradients from an
