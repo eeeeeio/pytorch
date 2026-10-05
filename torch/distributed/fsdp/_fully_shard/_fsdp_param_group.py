@@ -21,12 +21,18 @@ from torch.distributed.fsdp._common_utils import (
 from torch.profiler import record_function
 from torch.utils.hooks import RemovableHandle
 
+from ._all_gather_layout import (
+    _PersistentBuffers,
+    AllGatherLayout,
+    BackendOwnedAllGatherLayout,
+    DEFAULT_ALL_GATHER_LAYOUT,
+    DefaultAllGatherLayout,
+)
 from ._fsdp_api import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
 from ._fsdp_collectives import (
-    _default_all_gather_output_fn,
     _default_reduce_scatter_input_fn,
+    _wait_all_gather,
     AllGather,
-    AllGatherOutputFn,
     AllGatherResult,
     DefaultAllGather,
     DefaultReduceScatter,
@@ -260,7 +266,10 @@ class FSDPParamGroup:
 
         # - Communication and communication/computation overlap
         self.comm_ctx = FSDPCommContext()
-        self._all_gather_output_fn: AllGatherOutputFn = _default_all_gather_output_fn
+        self._all_gather_layout: AllGatherLayout = DEFAULT_ALL_GATHER_LAYOUT
+        # FSDP-owned buffers behind the all-gather outputs when a custom layout
+        # chose them on the first unshard, freed on reshard
+        self._all_gather_buffers: _PersistentBuffers | None = None
         self._prepare_reduce_scatter_inputs: PrepareReduceScatterInputsFn = (
             _default_reduce_scatter_input_fn
         )
@@ -405,6 +414,11 @@ class FSDPParamGroup:
         self._register_state_dict_hooks()
 
     def set_symm_mem(self, backend: Literal["NCCL"] = "NCCL") -> None:
+        if self._all_gather_layout.comm is not None:
+            raise AssertionError(
+                "cannot call set_symm_mem() while the all-gather layout is bound "
+                "to its comm"
+            )
         if not isinstance(self._all_gather_comm, (DefaultAllGather | SymmMemAllGather)):
             raise AssertionError(
                 "cannot call set_symm_mem() "
@@ -431,6 +445,11 @@ class FSDPParamGroup:
         Whether to (try to) use the ProcessGroup's allocate_tensor method for
         the staging buffers for collective comms.
         """
+        if self._all_gather_layout.comm is not None:
+            raise AssertionError(
+                "cannot call set_allocate_memory_from_process_group() while the "
+                "all-gather layout is bound to its comm"
+            )
         if not isinstance(
             self._all_gather_comm, (DefaultAllGather | ProcessGroupAllocAllGather)
         ):
@@ -505,6 +524,7 @@ class FSDPParamGroup:
                 *self.comm_ctx.get_all_gather_streams(async_op, self._training_state),
                 self.device,
                 self._all_gather_comm,
+                self._all_gather_layout,
             )
 
     @_disable_functorch_if_active
@@ -557,11 +577,12 @@ class FSDPParamGroup:
 
         else:
             with record_function(self._with_fqn("FSDP::all_gather_copy_out")):
-                foreach_all_gather_copy_out(
+                self._all_gather_buffers = foreach_all_gather_copy_out(
                     self._all_gather_result,
                     self.fsdp_params,
                     self._all_gather_process_group,
-                    all_gather_output_fn=self._all_gather_output_fn,
+                    self._all_gather_layout,
+                    self._all_gather_buffers,
                 )
 
         for fsdp_param in self.fsdp_params:
@@ -605,12 +626,9 @@ class FSDPParamGroup:
         # accumulated grad-reduction state, and restores sharded params.
         current_stream = self.device_handle.current_stream()
         if self._all_gather_result is not None:
-            if (event := self._all_gather_result.all_gather_event) is not None:
-                current_stream.wait_event(event)
-            work = self._all_gather_result.all_gather_work
-            if isinstance(work, dist.distributed_c10d.Work):
-                work.wait()
+            _wait_all_gather(self._all_gather_result)
             self._all_gather_result = None
+            self._release_all_gather_output()
         if self._post_reduce_event is not None:
             current_stream.wait_event(self._post_reduce_event)
             self._post_reduce_event = None
@@ -901,12 +919,9 @@ class FSDPParamGroup:
         if self._all_gather_result is not None:
             # If there was a mistargeted unshard without a corresponding wait,
             # then we wait here and clear the unshard
-            if (event := self._all_gather_result.all_gather_event) is not None:
-                torch.accelerator.current_stream().wait_event(event)
-            work = self._all_gather_result.all_gather_work
-            if isinstance(work, dist.distributed_c10d.Work):
-                work.wait()
+            _wait_all_gather(self._all_gather_result)
             self._all_gather_result = None
+            self._release_all_gather_output()
         self._post_forward_indices.clear()
 
     def _get_partial_reduce_grad(self, param: FSDPParam) -> torch.Tensor | None:
@@ -1120,15 +1135,38 @@ class FSDPParamGroup:
     # Utilities #
     def _to_sharded(self):
         if not self.is_sharded:
+            if self._all_gather_result is not None:
+                # A backward prefetch of a group that backward did not use was
+                # gathered over the post-forward mesh, which a later forward
+                # cannot copy out, so wait for it and discard it
+                _wait_all_gather(self._all_gather_result)
+                self._all_gather_result = None
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_sharded()
             self._sharded_state = ShardedState.SHARDED
+            if type(self._all_gather_layout) is not DefaultAllGatherLayout:
+                self._free_layout_storage()
 
     def _to_sharded_post_forward(self):
         if not self.is_sharded_post_forward:
+            # Parameters copy their post-forward shards out of shared buffers
+            # before the group frees them
             for fsdp_param in self.fsdp_params:
                 fsdp_param.to_sharded_post_forward()
             self._sharded_state = ShardedState.SHARDED_POST_FORWARD
+            if type(self._all_gather_layout) is not DefaultAllGatherLayout:
+                self._free_layout_storage()
+
+    def _free_layout_storage(self) -> None:
+        """Frees the FSDP-owned buffers that a custom layout chose and releases
+        a backend-owned layout's output lease."""
+        if self._all_gather_buffers is not None:
+            self._all_gather_buffers.free()
+        self._release_all_gather_output()
+
+    def _release_all_gather_output(self) -> None:
+        if isinstance(self._all_gather_layout, BackendOwnedAllGatherLayout):
+            self._all_gather_layout.release_output()
 
     def _to_unsharded(self):
         if not self.is_unsharded:

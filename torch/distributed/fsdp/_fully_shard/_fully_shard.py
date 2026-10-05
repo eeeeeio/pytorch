@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from torch.distributed._composable import contract
 
+from ._all_gather_layout import AllGatherLayout, DEFAULT_ALL_GATHER_LAYOUT
 from ._fsdp_api import (
     AllGather,
     DataParallelMeshDims,
@@ -20,9 +21,7 @@ from ._fsdp_api import (
     ReduceScatter,
 )
 from ._fsdp_collectives import (
-    _default_all_gather_output_fn,
     _default_reduce_scatter_input_fn,
-    AllGatherOutputFn,
     PrepareReduceScatterInputsFn,
 )
 from ._fsdp_common import _dynamo_disable, FSDPMeshInfo, ShardPlacementFnResult
@@ -312,6 +311,24 @@ def fully_shard(
         modules, cls_to_fsdp_cls, FSDPModule, "FSDP", _unimplemented_deepcopy
     )
     return arg_module
+
+
+def _check_all_gather_replaceable(fsdp_param_group: FSDPParamGroup) -> None:
+    # Unsharded parameters and pending results depend on the current backend's
+    # outputs, and outputs that view a custom layout's buffers keep their owner
+    if (
+        fsdp_param_group._all_gather_result is not None
+        or fsdp_param_group.is_unsharded
+        or any(
+            fsdp_param._keep_all_gather_output_storage
+            for fsdp_param in fsdp_param_group.fsdp_params
+        )
+    ):
+        raise ValueError(
+            "cannot replace an all-gather backend or layout with pending work, "
+            "unsharded parameters, or outputs that view a custom layout's "
+            "buffers; install it before the first unshard"
+        )
 
 
 def _unimplemented_deepcopy(*args: Any, **kwargs: Any) -> NoReturn:
@@ -738,6 +755,13 @@ class FSDPModule:
         to have better control over the communication and memory usage.
         See `Comm` and `ReduceScatter` for details.
 
+        This sets only the comm and keeps the installed all-gather layout. A
+        layout that requires a specific comm is installed with it by
+        :meth:`set_all_gather_layout`; while such a layout is installed, any
+        other comm is rejected. Install the comm before the first unshard:
+        replacement is rejected while an all-gather is pending, while parameters
+        are unsharded, or after they adopt output storage from a custom layout.
+
         Args:
             comm (AllGather): Custom all-gather communication.
         """
@@ -749,6 +773,15 @@ class FSDPModule:
                 "The custom comm would be ambiguous across groups with different meshes."
             )
         for fsdp_param_group in state._fsdp_param_groups:
+            bound_comm = fsdp_param_group._all_gather_layout.comm
+            if bound_comm is not None and comm is not bound_comm:
+                raise ValueError(
+                    "cannot install a different all-gather comm while the "
+                    "installed layout is bound to its comm; install another layout "
+                    "with set_all_gather_layout first"
+                )
+            if comm is not fsdp_param_group._all_gather_comm:
+                _check_all_gather_replaceable(fsdp_param_group)
             fsdp_param_group._all_gather_comm = comm
 
     def set_custom_reduce_scatter(self, comm: ReduceScatter) -> None:
@@ -859,48 +892,51 @@ class FSDPModule:
         for fsdp_param_group in state._fsdp_param_groups:
             fsdp_param_group.force_sum_reduction_for_comms = enable
 
-    def set_all_gather_output_fn(
-        self, fn: AllGatherOutputFn | None, /, *, recurse: bool = True
+    def set_all_gather_layout(
+        self, layout: AllGatherLayout | None, /, *, recurse: bool = True
     ) -> None:
-        r"""Set the function that copies a parameter group's all-gather outputs.
+        r"""Set the layout that packs and finalizes a parameter group's all-gather.
 
         .. warning::
-            This API is experimental. The callback signature and supported FSDP
+            This API is experimental. The layout contract and supported FSDP
             internals may change without backward compatibility.
 
-        The function is called as
-        ``fn(all_gather_output, outputs, split_sizes, outer_sizes, world_size)``.
-        ``all_gather_output`` is the flat rank-major collective buffer, and
-        ``outputs`` are the preallocated all-gather outputs of the parameter
-        group, viewed as ``uint8`` if the buffer is, in which case
-        ``split_sizes`` count bytes. For each output, ``split_sizes`` gives its
-        per-rank element count in the buffer and ``outer_sizes`` gives the
-        product of its dimensions before the concatenation dimension. Each
-        rank's slice is concatenated along that dimension into the output. A
-        tensor returned by ``fsdp_pre_all_gather`` may be smaller than its
-        cached output, which then has more than ``split_sizes[i] * world_size``
-        elements.
-        The function runs on the current stream after the collective completes
-        and must only write to ``outputs``. It is not called when the all-gather
-        buffer is empty or the group has a single rank, since FSDP then copies
-        the inputs directly.
-        See :mod:`torch.distributed.fsdp.experimental` for a native
-        implementation.
+        The layout packs the group's all-gather inputs before the collective and
+        turns the collective output into the parameters' all-gather outputs
+        after it completes.
+        :class:`~torch.distributed.fsdp.experimental.DefaultAllGatherLayout`
+        packs rank-major input and copies the output with its ``output_fn``,
+        e.g. ``DefaultAllGatherLayout(all_gather_output_fn_with_native_copy)``
+        for the native copy; it works with any comm that produces rank-major
+        output. This is the only way to install a layout. A layout whose
+        ``comm`` is set, e.g. one that views parameters into a backend-owned
+        buffer, requires that collective: installing the layout installs its
+        comm too, and the group then rejects any other comm, including from
+        :meth:`set_custom_all_gather`, until another layout is installed. Set
+        layouts before the first unshard.
 
         Args:
-            fn (Optional[Callable]): Copy-out function, or ``None`` to restore
+            layout (Optional[AllGatherLayout]): Layout, or ``None`` to restore
                 the default.
-            recurse (bool): Whether to also set the function for all nested FSDP
+            recurse (bool): Whether to also set the layout for all nested FSDP
                 modules. Defaults to ``True``.
         """
-        fn = _default_all_gather_output_fn if fn is None else fn
+        layout = DEFAULT_ALL_GATHER_LAYOUT if layout is None else layout
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, FSDPModule):
                 state = module._get_fsdp_state()
                 for fsdp_param_group in state._fsdp_param_groups:
-                    fsdp_param_group._all_gather_output_fn = fn
+                    comm = layout.comm or fsdp_param_group._all_gather_comm
+                    if (
+                        layout is not fsdp_param_group._all_gather_layout
+                        or comm is not fsdp_param_group._all_gather_comm
+                    ):
+                        _check_all_gather_replaceable(fsdp_param_group)
+                    layout._bind_owner(fsdp_param_group)
+                    fsdp_param_group._all_gather_layout = layout
+                    fsdp_param_group._all_gather_comm = comm
 
     def set_reduce_scatter_input_fn(
         self, fn: PrepareReduceScatterInputsFn | None, /, *, recurse: bool = True
