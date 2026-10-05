@@ -43,6 +43,10 @@ from torch.distributed.fsdp._fully_shard._fsdp_common import (
     TrainingState,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+from torch.distributed.fsdp.experimental import (
+    all_gather_output_fn_with_native_copy,
+    reduce_scatter_input_fn_with_native_copy,
+)
 from torch.distributed.tensor import DTensor, init_device_mesh, Shard
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.testing._internal.common_distributed import (
@@ -85,6 +89,10 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 c10d_ops = torch.ops.c10d
 funcol = torch.ops.c10d_functional
+native_copy_fns = (
+    all_gather_output_fn_with_native_copy,
+    reduce_scatter_input_fn_with_native_copy,
+)
 
 from torch.testing._internal.common_fsdp import get_devtype
 
@@ -488,6 +496,7 @@ class TestFullyShard1DTrainingCore(FSDPTest):
                     [(16, 17), (17, 8)],
                 ],
                 "use_shard_placement_fn": [False],
+                "copy_fns": [(None, None), native_copy_fns],
             },
             self._test_train_parity_single_group,
         )
@@ -505,6 +514,7 @@ class TestFullyShard1DTrainingCore(FSDPTest):
                 "use_shard_placement_fn": [True],
                 # False tests Shard(1)-only weights; True adds Shard(0) biases.
                 "bias": [False, True],
+                "copy_fns": [(None, None), native_copy_fns],
             },
             self._test_train_parity_single_group,
         )
@@ -514,6 +524,7 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         lin_shapes: list[tuple[int, int]],
         use_shard_placement_fn: bool,
         bias: bool = True,
+        copy_fns: tuple[Callable | None, Callable | None] = (None, None),
     ):
         torch.manual_seed(42)
         model = nn.Sequential(
@@ -530,6 +541,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
 
         shard_placement_fn = _shard_placement_fn if use_shard_placement_fn else None
         fully_shard(model, shard_placement_fn=shard_placement_fn)
+        model.set_all_gather_output_fn(copy_fns[0])
+        model.set_reduce_scatter_input_fn(copy_fns[1])
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
         torch.manual_seed(42 + self.rank + 1)
         inp = (torch.randn((4, lin_shapes[0][0]), device=device_type.type),)
@@ -3377,10 +3390,18 @@ class TestFullyShardInference(FSDPTest):
         return 2
 
     def test_inference(self):
+        copy_fns = [None, all_gather_output_fn_with_native_copy]
+        self.run_subtests(
+            {"all_gather_output_fn": copy_fns},
+            self._test_inference,
+        )
+
+    def _test_inference(self, all_gather_output_fn: Callable | None):
         torch.manual_seed(42)
         model = nn.Linear(8, 4, bias=False, device=device_type)
         ref_model = copy.deepcopy(model)
         fully_shard(model, shard_placement_fn=lambda _: Shard(1))
+        model.set_all_gather_output_fn(all_gather_output_fn)
         with torch.inference_mode():
             inp = torch.ones((2, 8), device=device_type)
             self.assertEqual(model(inp), ref_model(inp))
